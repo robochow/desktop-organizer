@@ -10,6 +10,8 @@
 
     By default you get a preview and a confirmation prompt, just like organizing.
 
+    The restore logic lives in DesktopOrganizer.Engine.ps1 (shared with the GUI).
+
 .PARAMETER LogFile
     A specific log file to undo. Defaults to the newest log in LogDirectory.
 
@@ -38,31 +40,30 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'DesktopOrganizer.Engine.ps1')
+
 # Locate the log to undo.
 if (-not $LogFile) {
     if (-not (Test-Path -LiteralPath $LogDirectory)) {
         Write-Host "No log directory found at $LogDirectory - nothing to undo." -ForegroundColor Yellow
         return
     }
-    $latest = Get-ChildItem -LiteralPath $LogDirectory -Filter 'organize_*.json' -File |
-        Where-Object { $_.Name -notlike '*.undone.json' } |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $latest) {
+    $LogFile = Get-LatestOrganizeLog -LogDirectory $LogDirectory
+    if (-not $LogFile) {
         Write-Host "No organize logs found in $LogDirectory - nothing to undo." -ForegroundColor Yellow
         return
     }
-    $LogFile = $latest.FullName
 }
 
 if (-not (Test-Path -LiteralPath $LogFile)) {
     throw "Log file not found: $LogFile"
 }
 
-$log = Get-Content -LiteralPath $LogFile -Raw | ConvertFrom-Json
+# Work out what can be restored vs skipped (moves nothing yet).
+$preview = Get-OrganizeUndoPlan -LogFile $LogFile
+$restoreCount = $preview.Restorable.Count
 
-# Handle a log with no moves gracefully (ConvertFrom-Json gives $null for empty arrays).
-$moves = @($log.Moves)
-if ($moves.Count -eq 0) {
+if ($restoreCount -eq 0 -and $preview.Skips.Count -eq 0) {
     Write-Host "Log contains no moves - nothing to undo." -ForegroundColor Green
     return
 }
@@ -70,33 +71,18 @@ if ($moves.Count -eq 0) {
 Write-Host ''
 Write-Host "Undo Desktop Organizer" -ForegroundColor Cyan
 Write-Host "  Log : $LogFile"
-Write-Host "  Run : $($log.RunAtUtc) (UTC)"
+Write-Host "  Run : $($preview.RunAtUtc) (UTC)"
 Write-Host ''
-Write-Host "Will attempt to restore $($moves.Count) file(s) to their original locations:" -ForegroundColor Yellow
+Write-Host "Will attempt to restore $restoreCount file(s) to their original locations:" -ForegroundColor Yellow
 Write-Host ''
-
-# We undo in reverse order so numeric-suffix renames unwind cleanly.
-[array]::Reverse($moves)
-
-$skips = New-Object System.Collections.Generic.List[string]
-foreach ($m in $moves) {
-    $fromNow = $m.To       # where the file currently is
-    $backTo  = $m.From     # where it should return to
-    if (-not (Test-Path -LiteralPath $fromNow)) {
-        $skips.Add("MISSING (already moved/deleted): $fromNow")
-        continue
-    }
-    if (Test-Path -LiteralPath $backTo) {
-        $skips.Add("BLOCKED (original location occupied): $backTo")
-        continue
-    }
-    Write-Host ("  {0}  ->  {1}" -f $fromNow, $backTo)
+foreach ($item in $preview.Restorable) {
+    Write-Host ("  {0}  ->  {1}" -f $item.From, $item.To)
 }
 
-if ($skips.Count -gt 0) {
+if ($preview.Skips.Count -gt 0) {
     Write-Host ''
     Write-Host "These entries will be skipped:" -ForegroundColor DarkYellow
-    foreach ($s in $skips) { Write-Host "  $s" -ForegroundColor DarkYellow }
+    foreach ($s in $preview.Skips) { Write-Host "  $s" -ForegroundColor DarkYellow }
 }
 Write-Host ''
 
@@ -108,39 +94,15 @@ if (-not $Force) {
     }
 }
 
-$restored = 0
-$skipped = 0
-foreach ($m in $moves) {
-    $fromNow = $m.To
-    $backTo  = $m.From
-    try {
-        if (-not (Test-Path -LiteralPath $fromNow)) { $skipped++; continue }
-        if (Test-Path -LiteralPath $backTo)         { $skipped++; continue }
+# Execute the restore via the shared engine.
+$result = Invoke-OrganizeUndo -LogFile $LogFile
 
-        $backParent = Split-Path -Parent $backTo
-        if (-not (Test-Path -LiteralPath $backParent)) {
-            New-Item -ItemType Directory -Path $backParent -Force | Out-Null
-        }
-        Move-Item -LiteralPath $fromNow -Destination $backTo -ErrorAction Stop
-        $restored++
-        Write-Host ("  restored: {0}" -f [System.IO.Path]::GetFileName($backTo)) -ForegroundColor Green
-    } catch {
-        $skipped++
-        Write-Warning ("could not restore '{0}': {1}" -f $fromNow, $_.Exception.Message)
-    }
+foreach ($f in $result.Failures) {
+    Write-Warning ("could not restore '{0}': {1}" -f $f.From, $f.Error)
 }
 
 Write-Host ''
-Write-Host ("Undo complete. Restored {0} file(s), skipped {1}." -f $restored, $skipped) -ForegroundColor Green
-
-# Mark the log as undone so a later undo doesn't pick it up by default.
-if ($restored -gt 0) {
-    $undoneName = [System.IO.Path]::ChangeExtension($LogFile, $null).TrimEnd('.') + '.undone.json'
-    try {
-        Rename-Item -LiteralPath $LogFile -NewName ([System.IO.Path]::GetFileName($undoneName)) -ErrorAction Stop
-        Write-Host ("Log marked as undone: {0}" -f $undoneName)
-    } catch {
-        # Non-fatal: the restore already happened.
-        Write-Verbose "Could not rename log file: $($_.Exception.Message)"
-    }
+Write-Host ("Undo complete. Restored {0} file(s), skipped {1}." -f $result.Restored, $result.Skipped) -ForegroundColor Green
+if ($result.UndoneAs) {
+    Write-Host ("Log marked as undone: {0}" -f $result.UndoneAs)
 }
