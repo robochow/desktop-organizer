@@ -4,14 +4,17 @@ Automatically sorts the loose files cluttering your Windows Desktop into clearly
 named category folders — **Documents, Images, Screenshots, Videos, Installers,
 Archives, Spreadsheets, PDFs**, and **Misc** for anything else.
 
+- **Two ways to use it** — a clean windowed **GUI** for clicking around, or the
+  console scripts for automation. Both run on the *same engine*.
 - **OneDrive-aware** — finds your real Desktop even if it's redirected into OneDrive.
 - **Folders are never touched** — only loose files get moved.
 - **Dry-run preview + confirmation** before anything moves (interactive runs).
 - **Never overwrites** — duplicate names get a ` (1)`, ` (2)` suffix.
-- **Full undo** — every move is logged; one command puts everything back.
+- **Full undo** — every move is logged; one command (or one button) puts everything back.
 - **Weekly auto-run** via Task Scheduler, which skips the prompt but still logs.
 
-No installation, no modules, no admin rights. Plain PowerShell.
+No installation, no modules, no admin rights. Plain PowerShell (the GUI uses WPF,
+which ships with every modern Windows).
 
 ---
 
@@ -19,14 +22,19 @@ No installation, no modules, no admin rights. Plain PowerShell.
 
 | Script | What it does |
 |---|---|
-| `Organize-Desktop.ps1` | Scans the Desktop, previews, confirms, and moves files. |
+| `Organize-Desktop-GUI.ps1` | **The windowed app.** Scan, tick/untick files, organize, undo. |
+| `Create-Shortcut.ps1` | Puts a double-click shortcut (with icon) on your Desktop / Start Menu. |
+| `Organize-Desktop.ps1` | Console version: scans the Desktop, previews, confirms, and moves files. |
 | `Undo-LastOrganize.ps1` | Reverses a run using its log (newest by default). |
 | `Register-WeeklyTask.ps1` | Sets up the weekly scheduled task. |
 | `Unregister-WeeklyTask.ps1` | Removes the scheduled task. |
+| `DesktopOrganizer.Engine.ps1` | **Shared engine.** All the scanning/moving/undo/logging logic lives here; every script above (GUI and console) is just a front end over it. Keep it next to the others. |
 
 Logs are written to `%LOCALAPPDATA%\DesktopOrganizer\logs` (i.e.
 `C:\Users\<you>\AppData\Local\DesktopOrganizer\logs`). They live **off** the
-Desktop on purpose, so the organizer never sorts its own logs.
+Desktop on purpose, so the organizer never sorts its own logs. The GUI, the
+console script and the scheduled task all read and write the **same** logs, so you
+can organize in one and undo in another.
 
 ---
 
@@ -60,6 +68,62 @@ Desktop on purpose, so the organizer never sorts its own logs.
    ```powershell
    .\Undo-LastOrganize.ps1
    ```
+
+Prefer clicking to typing? Jump to **[Use the GUI](#use-the-gui-windowed-app)**.
+
+---
+
+## Use the GUI (windowed app)
+
+The GUI is the friendliest way to drive the organizer. It does everything the
+console script does, with a live preview you can edit before anything moves.
+
+### Launch it
+
+The nicest way is to make a desktop shortcut once, then double-click it:
+
+```powershell
+.\Create-Shortcut.ps1            # adds a "Desktop Organizer" shortcut to your Desktop
+# or
+.\Create-Shortcut.ps1 -Location Both   # Desktop + Start Menu
+```
+
+Double-click the shortcut and the window opens — **no PowerShell window appears
+behind it.** (The shortcut launches Windows PowerShell hidden, and the GUI also
+hides its own console on startup.)
+
+You can also start it directly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Organize-Desktop-GUI.ps1
+```
+
+> WPF needs a single-threaded apartment (STA). Windows PowerShell 5.1 — the
+> `powershell.exe` that's preinstalled on every Windows machine — is STA by
+> default, so the shortcut uses it. If you launch the GUI from PowerShell 7
+> (`pwsh`), it automatically relaunches itself STA, so it still works.
+
+### What the window does
+
+- **Scan** — previews every loose file that *would* move, in a grid with **File
+  Name**, **Current Location**, and **Destination Category**. (It also scans
+  automatically when the window opens.)
+- **Checkboxes (“Move?” column)** — every file starts ticked. Untick any you want
+  to leave on the Desktop. **Check all / Uncheck all** flip them in bulk.
+- **Organize Now** — moves only the ticked files, asks you to confirm first, then
+  shows the result. Same safety rules as always: never overwrites, always logs.
+- **Undo Last Run** — restores the most recent run from its log (the same log the
+  console undo uses).
+- **Settings**
+  - **Categories to organize** — tick/untick whole categories. Unticked
+    categories are left on the Desktop entirely. Re-**Scan** to apply.
+  - **Group screenshots into month subfolders** — files screenshots into
+    `Screenshots\yyyy-MM` (the month comes from the date in the filename, falling
+    back to the file's date).
+- **Status bar** (bottom) — shows results like `32 files moved, 0 errors`.
+
+The window uses a dark theme with sensible padding and the Segoe UI font — not a
+1998 gray dialog.
 
 ---
 
@@ -159,8 +223,10 @@ Screenshots are checked **before** Images, so a `Screenshot ....png` lands in
   `-IncludeShortcuts` if you want them filed too.
 - Hidden/system files like `desktop.ini`, and the organizer's own scripts.
 
-Want to tweak the mapping? Edit the `$ExtensionMap` and `$ScreenshotPatterns`
-tables near the top of `Organize-Desktop.ps1` — they're plain hashtables.
+Want to tweak the mapping? Edit the `ExtensionMap` and `ScreenshotPatterns` tables
+in `Get-DesktopOrganizerConfig` near the top of `DesktopOrganizer.Engine.ps1` —
+they're plain hashtables, and the change applies to the GUI, the console script
+and the scheduled task at once.
 
 ---
 
@@ -185,6 +251,21 @@ To undo a *specific* earlier run:
 ---
 
 ## Command reference
+
+**`Organize-Desktop-GUI.ps1`**
+
+| Parameter | Purpose |
+|---|---|
+| `-DesktopPath <path>` | Override the auto-detected Desktop (rarely needed). |
+| `-LogDirectory <path>` | Where to read/write logs. Defaults to `%LOCALAPPDATA%\DesktopOrganizer\logs`. |
+
+**`Create-Shortcut.ps1`**
+
+| Parameter | Purpose |
+|---|---|
+| `-Location <where>` | `Desktop` (default), `StartMenu`, or `Both`. |
+| `-Name <name>` | Shortcut name (default `Desktop Organizer`). |
+| `-IconPath <path>` | Custom icon (`.ico`, or `file.dll,index`). Defaults to a system folder icon. |
 
 **`Organize-Desktop.ps1`**
 
@@ -214,3 +295,10 @@ To undo a *specific* earlier run:
 - **"Running scripts is disabled on this system."** See *execution policy* above.
 - **Wrong Desktop detected** (multiple profiles, custom redirection): pass
   `-DesktopPath` explicitly, e.g. `.\Organize-Desktop.ps1 -DesktopPath "$env:OneDrive\Desktop"`.
+- **The GUI doesn't open / closes immediately.** Make sure
+  `DesktopOrganizer.Engine.ps1` sits in the *same folder* as the GUI script (every
+  script depends on it). Try launching it directly to see any error:
+  `powershell -ExecutionPolicy Bypass -File .\Organize-Desktop-GUI.ps1`.
+- **Shortcut opens a blank console instead of the window.** Re-run
+  `.\Create-Shortcut.ps1` after moving the scripts — the shortcut stores the
+  folder path, so it must be regenerated if you relocate the files.
