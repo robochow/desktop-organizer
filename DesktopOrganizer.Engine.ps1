@@ -83,6 +83,32 @@ function Get-DesktopOrganizerConfig {
             'register-weeklytask.ps1','unregister-weeklytask.ps1',
             'desktoporganizer.engine.ps1','create-shortcut.ps1'
         )
+
+        # --- Folder consolidation (Cleanup mode) --------------------------------
+        # Theme name => the words that signal that theme. The theme name doubles as
+        # the canonical target folder a redundant group consolidates into.
+        FolderThemes       = ([ordered]@{
+            Pictures  = @('pic','pics','picture','pictures','photo','photos','image','images','img','imgs','wallpaper','wallpapers','camera','screenshot','screenshots','snaps','snapshots')
+            Documents = @('doc','docs','document','documents','word','text','txt','note','notes','paper','papers','essay','essays','report','reports','letters')
+            Music     = @('music','song','songs','audio','mp3','mp3s','tracks','albums')
+            Videos    = @('video','videos','movie','movies','clip','clips','footage')
+            Downloads = @('download','downloads','dl')
+        })
+        # Noise words ignored when matching a folder name to a theme.
+        FolderFillerWords  = @('assorted','more','random','misc','miscellaneous','new','old','stuff','various','my','the','a','an','folder','folders','copy','untitled','temp','tmp','files','file','and','of','to','for','some','other','extra')
+        # Folders that must never be touched by consolidation (matched lower-case,
+        # plus anything starting with '.', '__' or '$', plus hidden/system folders,
+        # plus the organizer's own category folders, plus any folder containing an
+        # executable - see Test-ProtectedFolder).
+        ProtectedFolderNames = @(
+            '__macosx','config','appdata','application data','windows','program files',
+            'program files (x86)','programdata','system volume information','$recycle.bin',
+            'recovery','node_modules','.git','.vs','.idea','bin','obj','venv','.venv','env',
+            'onedrive','dropbox','google drive'
+        )
+        # File extensions that mark a folder as an application folder (never touch).
+        ExecutableExtensions = @('.exe','.dll','.msi','.com','.bat','.cmd')
+
         DefaultLogDirectory = (Join-Path $localAppData 'DesktopOrganizer\logs')
     }
 }
@@ -273,19 +299,28 @@ function New-OrganizePlan {
     return $plan
 }
 
-function Invoke-OrganizePlan {
+function Invoke-OrganizerMovePlan {
     <#
-        Executes a move plan: creates destination folders as needed, moves each
-        file (never overwriting - destinations were pre-resolved), and writes a JSON
-        move-log. Returns a result object with MovedCount, FailedCount, LogPath,
-        Moves (succeeded) and Failures. Presentation is left to the caller.
+        The shared executor behind organizing, folder consolidation and renaming.
+        Moves each plan item (creating destination folders; never overwriting, since
+        destinations are pre-resolved), optionally removes source folders that end up
+        empty, and writes a JSON move-log that the undo reads back. Every operation
+        produces the same log shape, so "Undo Last Run" reverses any of them.
+
+        Plan items need .Source, .Destination and .Category.
+
+        Returns: LogPath, Operation, MovedCount, FailedCount, Moves, Failures,
+        RemovedFolders.
     #>
     [CmdletBinding()]
     param(
         [object[]] $Plan,
         [string]   $DesktopPath,
         [string]   $LogDirectory = (Get-DesktopOrganizerConfig).DefaultLogDirectory,
-        [switch]   $Unattended
+        [switch]   $Unattended,
+        [ValidateSet('organize','consolidate','rename')]
+        [string]   $Operation = 'organize',
+        [string[]] $RemoveEmptyFolders
     )
 
     if (-not (Test-Path -LiteralPath $LogDirectory)) {
@@ -300,7 +335,7 @@ function Invoke-OrganizePlan {
     foreach ($item in $Plan) {
         $destFolder = Split-Path -Parent $item.Destination
         try {
-            if (-not (Test-Path -LiteralPath $destFolder)) {
+            if ($destFolder -and -not (Test-Path -LiteralPath $destFolder)) {
                 New-Item -ItemType Directory -Path $destFolder -Force | Out-Null
             }
             Move-Item -LiteralPath $item.Source -Destination $item.Destination -ErrorAction Stop
@@ -321,12 +356,27 @@ function Invoke-OrganizePlan {
         }
     }
 
+    # After consolidation, remove any source folder we fully emptied. Undo recreates
+    # it implicitly by restoring its files, so nothing extra needs logging.
+    $removedFolders = New-Object System.Collections.Generic.List[string]
+    foreach ($folder in @($RemoveEmptyFolders)) {
+        if (-not $folder) { continue }
+        try {
+            if ((Test-Path -LiteralPath $folder) -and
+                -not (Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $folder -Force -ErrorAction Stop
+                $removedFolders.Add($folder)
+            }
+        } catch { }   # non-fatal: the file moves already succeeded
+    }
+
     # The log stores only the bookkeeping fields the undo needs.
     $logMoves = @($moves | ForEach-Object {
         [pscustomobject]@{ Category = $_.Category; From = $_.From; To = $_.To; MovedAtUtc = $_.MovedAtUtc }
     })
     $logObject = [pscustomobject]@{
         Schema      = 'desktop-organizer/move-log@1'
+        Operation   = $Operation
         RunAtUtc    = (Get-Date).ToUniversalTime().ToString('o')
         Desktop     = $DesktopPath
         Unattended  = [bool]$Unattended
@@ -337,12 +387,30 @@ function Invoke-OrganizePlan {
     $logObject | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $logPath -Encoding UTF8
 
     [pscustomobject]@{
-        LogPath     = $logPath
-        MovedCount  = $moves.Count
-        FailedCount = $failures.Count
-        Moves       = $moves.ToArray()
-        Failures    = $failures.ToArray()
+        LogPath        = $logPath
+        Operation      = $Operation
+        MovedCount     = $moves.Count
+        FailedCount    = $failures.Count
+        Moves          = $moves.ToArray()
+        Failures       = $failures.ToArray()
+        RemovedFolders = $removedFolders.ToArray()
     }
+}
+
+function Invoke-OrganizePlan {
+    <#
+        Executes an organize plan (loose files into category folders). Thin wrapper
+        over Invoke-OrganizerMovePlan for backward compatibility.
+    #>
+    [CmdletBinding()]
+    param(
+        [object[]] $Plan,
+        [string]   $DesktopPath,
+        [string]   $LogDirectory = (Get-DesktopOrganizerConfig).DefaultLogDirectory,
+        [switch]   $Unattended
+    )
+    Invoke-OrganizerMovePlan -Plan $Plan -DesktopPath $DesktopPath `
+        -LogDirectory $LogDirectory -Unattended:$Unattended -Operation 'organize'
 }
 
 function Get-LatestOrganizeLog {
@@ -452,4 +520,245 @@ function Invoke-OrganizeUndo {
         LogFile     = $LogFile
         UndoneAs    = $undoneName
     }
+}
+
+# ==================================================================================
+# Folder consolidation (Cleanup mode)
+# ==================================================================================
+
+function Test-ProtectedFolder {
+    <#
+        Returns $true if a Desktop folder must never be touched by consolidation:
+        hidden/system folders, dotted/__/$ names, known system & app folders, the
+        organizer's own category folders, and any folder containing an executable
+        (a sign it's an application folder).
+    #>
+    param(
+        [System.IO.DirectoryInfo] $Folder,
+        [object] $Config = (Get-DesktopOrganizerConfig)
+    )
+
+    $lower = $Folder.Name.ToLowerInvariant()
+
+    if ($Folder.Attributes -band [System.IO.FileAttributes]::Hidden) { return $true }
+    if ($Folder.Attributes -band [System.IO.FileAttributes]::System) { return $true }
+    if ($lower.StartsWith('.') -or $lower.StartsWith('__') -or $lower.StartsWith('$')) { return $true }
+    if ($Config.ProtectedFolderNames -contains $lower) { return $true }
+    # -contains is case-insensitive: protects 'Documents','Images', etc.
+    if ($Config.Categories -contains $Folder.Name) { return $true }
+
+    # App folders: contain an executable anywhere inside.
+    $exe = Get-ChildItem -LiteralPath $Folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $Config.ExecutableExtensions -contains $_.Extension.ToLowerInvariant() } |
+        Select-Object -First 1
+    if ($exe) { return $true }
+
+    return $false
+}
+
+function Get-FolderTheme {
+    <#
+        Maps a folder name to a canonical theme (Pictures/Documents/Music/Videos/
+        Downloads) by matching its words against the theme keyword lists, ignoring
+        filler words like "assorted"/"more"/"random". Returns $null if no match.
+        The theme name doubles as the consolidation target folder name.
+    #>
+    param(
+        [string] $FolderName,
+        [object] $Config = (Get-DesktopOrganizerConfig)
+    )
+
+    $tokens = @($FolderName.ToLowerInvariant() -split '[^a-z0-9]+' |
+        Where-Object { $_ -and ($Config.FolderFillerWords -notcontains $_) })
+
+    foreach ($theme in $Config.FolderThemes.Keys) {
+        $keywords = $Config.FolderThemes[$theme]
+        foreach ($t in $tokens) {
+            if ($keywords -contains $t) { return [string]$theme }
+        }
+    }
+    return $null
+}
+
+function New-FolderConsolidationPlan {
+    <#
+        Scans top-level Desktop folders and suggests consolidating obviously
+        redundant ones (two or more sharing a theme) into a single canonical folder.
+        Moves nothing. Returns one row per source folder: Theme, SourceFolder,
+        SourceFolderPath, TargetFolder, TargetFolderPath, FileCount.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $DesktopPath,
+        [object] $Config = (Get-DesktopOrganizerConfig)
+    )
+
+    if (-not $DesktopPath) { $DesktopPath = Resolve-DesktopPath }
+
+    $folders = @(Get-ChildItem -LiteralPath $DesktopPath -Directory -Force -ErrorAction SilentlyContinue)
+
+    # Group eligible folders by theme.
+    $byTheme = @{}
+    foreach ($f in $folders) {
+        if (Test-ProtectedFolder -Folder $f -Config $Config) { continue }
+        $theme = Get-FolderTheme -FolderName $f.Name -Config $Config
+        if (-not $theme) { continue }
+        if (-not $byTheme.ContainsKey($theme)) {
+            $byTheme[$theme] = New-Object System.Collections.Generic.List[object]
+        }
+        $byTheme[$theme].Add($f)
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($theme in $byTheme.Keys) {
+        $group = $byTheme[$theme]
+        if ($group.Count -lt 2) { continue }   # only suggest genuinely redundant groups
+        $targetPath = Join-Path $DesktopPath $theme
+        foreach ($f in $group) {
+            if ($f.FullName -ieq $targetPath) { continue }   # this folder already IS the target
+            $fileCount = @(Get-ChildItem -LiteralPath $f.FullName -File -Force -ErrorAction SilentlyContinue).Count
+            $rows.Add([pscustomobject]@{
+                Theme            = $theme
+                SourceFolder     = $f.Name
+                SourceFolderPath = $f.FullName
+                TargetFolder     = $theme
+                TargetFolderPath = $targetPath
+                FileCount        = $fileCount
+            })
+        }
+    }
+
+    return @($rows | Sort-Object TargetFolder, SourceFolder)
+}
+
+function Expand-FolderConsolidation {
+    <#
+        Turns approved consolidation rows into concrete move items, re-enumerating
+        each source folder's top-level files at call time. Destinations are resolved
+        with a shared planner so two folders merging into the same target never
+        collide. Returns: Moves (Source/Destination/Category) and RemoveFolders
+        (the source folders to delete once emptied).
+    #>
+    [CmdletBinding()]
+    param(
+        [object[]] $Approved,
+        [object]   $Config = (Get-DesktopOrganizerConfig)
+    )
+
+    $planned = New-Object 'System.Collections.Generic.HashSet[string]'
+    $moves = New-Object System.Collections.Generic.List[object]
+    $removeFolders = New-Object System.Collections.Generic.List[string]
+
+    foreach ($a in $Approved) {
+        $src = $a.SourceFolderPath
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+
+        $files = @(Get-ChildItem -LiteralPath $src -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $Config.ExcludedNames -notcontains $_.Name.ToLowerInvariant() })
+
+        foreach ($file in $files) {
+            $dest = Get-SafeDestination -DestFolder $a.TargetFolderPath -FileName $file.Name -Planned $planned
+            $moves.Add([pscustomobject]@{
+                Category    = "Consolidate -> $($a.TargetFolder)"
+                Source      = $file.FullName
+                Destination = $dest
+            })
+        }
+        $removeFolders.Add($src)
+    }
+
+    [pscustomobject]@{
+        Moves         = $moves.ToArray()
+        RemoveFolders = $removeFolders.ToArray()
+    }
+}
+
+# ==================================================================================
+# Filename cleanup (Clean Names mode)
+# ==================================================================================
+
+function Get-CleanFileName {
+    <#
+        Returns a tidied version of a filename: underscores -> spaces, collapsed
+        double spaces, removed "- Copy"/"(copy)"/"Copy of" and trailing "(1) (2)"
+        copy markers, dropped long random digit runs, and Title Case. The file
+        extension is preserved exactly. Never returns an empty name.
+    #>
+    param([string] $FileName)
+
+    $ext  = [System.IO.Path]::GetExtension($FileName)
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    $name = $base
+
+    $name = $name -replace '_', ' '                              # underscores -> spaces
+    $name = $name -replace '(?i)^\s*copy of\s+', ''              # leading "Copy of "
+    $name = $name -replace '(?i)\s*\(copy\)\s*$', ''             # trailing "(copy)"
+    $name = $name -replace '(?i)[\s-]+copy(\s*\(\d+\))?\s*$', '' # " - Copy", " copy (2)"
+    $name = $name -replace '(?:\s*\(\s*\d+\s*\)\s*)+$', ''       # trailing "(1)", "(1) (2)"
+
+    # Drop standalone long digit runs (timestamps / random ids).
+    $tokens = @($name -split '\s+' | Where-Object { $_ -ne '' -and $_ -notmatch '^\d{5,}$' })
+    $name = ($tokens -join ' ')
+
+    $name = ($name -replace '\s{2,}', ' ').Trim(([char[]]" -._"))
+    if (-not $name) { $name = $base.Trim() }                     # never end up empty
+
+    # Title Case (lower first so ALL CAPS normalizes). Extension untouched.
+    $name = (Get-Culture).TextInfo.ToTitleCase($name.ToLowerInvariant())
+
+    return ($name + $ext)
+}
+
+function New-RenamePlan {
+    <#
+        Proposes cleaned-up names for loose Desktop files. Moves/renames nothing.
+        Returns rows: Source, Destination, OldName, NewName, Category. Renames that
+        would collide get a numeric suffix (never overwriting); pure case changes are
+        allowed through. Files already clean are skipped.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $DesktopPath,
+        [object] $Config = (Get-DesktopOrganizerConfig)
+    )
+
+    if (-not $DesktopPath) { $DesktopPath = Resolve-DesktopPath }
+
+    $looseFiles = @(Get-ChildItem -LiteralPath $DesktopPath -File -Force -ErrorAction SilentlyContinue | Where-Object {
+        $name = $_.Name.ToLowerInvariant()
+        if ($Config.ExcludedNames -contains $name) { return $false }
+        if ($_.Attributes -band [System.IO.FileAttributes]::Hidden) { return $false }
+        if ($_.Attributes -band [System.IO.FileAttributes]::System) { return $false }
+        if ($Config.ScriptNames -contains $name) { return $false }
+        if ($_.Extension -in @('.lnk','.url')) { return $false }
+        return $true
+    })
+
+    $planned = New-Object 'System.Collections.Generic.HashSet[string]'
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $looseFiles) {
+        $newName = Get-CleanFileName -FileName $file.Name
+        if ($newName -ceq $file.Name) { continue }   # already clean (exact match)
+
+        $srcFolder = $file.DirectoryName
+        $targetPath = Join-Path $srcFolder $newName
+
+        if ($targetPath -ieq $file.FullName) {
+            # Pure case change - allowed even though Test-Path is case-insensitive.
+            $dest = $targetPath
+            [void]$planned.Add($dest.ToLowerInvariant())
+        } else {
+            $dest = Get-SafeDestination -DestFolder $srcFolder -FileName $newName -Planned $planned
+        }
+
+        $rows.Add([pscustomobject]@{
+            Source      = $file.FullName
+            Destination = $dest
+            OldName     = $file.Name
+            NewName     = [System.IO.Path]::GetFileName($dest)
+            Category    = 'Rename'
+        })
+    }
+
+    return $rows.ToArray()
 }

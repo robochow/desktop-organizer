@@ -4,6 +4,10 @@ Automatically sorts the loose files cluttering your Windows Desktop into clearly
 named category folders — **Documents, Images, Screenshots, Videos, Installers,
 Archives, Spreadsheets, PDFs**, and **Misc** for anything else.
 
+- **Three cleanup modes in the GUI** — **Organize Files** into categories,
+  **Consolidate Folders** (merge redundant folders like *Assorted Pictures* + *More
+  Random Pics*), and **Clean Names** (Title-Case messy filenames). All preview-first
+  and undoable.
 - **Two ways to use it** — a clean windowed **GUI** for clicking around, or the
   console scripts for automation. Both run on the *same engine*.
 - **OneDrive-aware** — finds your real Desktop even if it's redirected into OneDrive.
@@ -103,24 +107,46 @@ powershell -ExecutionPolicy Bypass -File .\Organize-Desktop-GUI.ps1
 > default, so the shortcut uses it. If you launch the GUI from PowerShell 7
 > (`pwsh`), it automatically relaunches itself STA, so it still works.
 
-### What the window does
+### Three tabs, one safety model
 
-- **Scan** — previews every loose file that *would* move, in a grid with **File
-  Name**, **Current Location**, and **Destination Category**. (It also scans
-  automatically when the window opens.)
-- **Checkboxes (“Move?” column)** — every file starts ticked. Untick any you want
-  to leave on the Desktop. **Check all / Uncheck all** flip them in bulk.
-- **Organize Now** — moves only the ticked files, asks you to confirm first, then
-  shows the result. Same safety rules as always: never overwrites, always logs.
-- **Undo Last Run** — restores the most recent run from its log (the same log the
-  console undo uses).
-- **Settings**
-  - **Categories to organize** — tick/untick whole categories. Unticked
-    categories are left on the Desktop entirely. Re-**Scan** to apply.
-  - **Group screenshots into month subfolders** — files screenshots into
-    `Screenshots\yyyy-MM` (the month comes from the date in the filename, falling
-    back to the file's date).
-- **Status bar** (bottom) — shows results like `32 files moved, 0 errors`.
+The window has three tabs. Every one is **preview-first** (scan, review, tick the
+rows you want), **never overwrites**, and **writes to the same undo log** — so the
+shared **Undo Last Run** button (and the bottom **status bar**, e.g. `32 files
+moved, 0 errors`) work no matter which tab you used last.
+
+**1. Organize Files** *(the original feature)*
+- **Scan** previews every loose file that would move, in a grid with **File Name**,
+  **Current Location**, **Destination Category**. (Scans automatically on open.)
+- Each row has a **Move?** checkbox (all start ticked). **Check all / Uncheck all**
+  flip them in bulk.
+- **Organize Now** moves only the ticked files (after a confirm).
+- **Settings**: tick/untick whole **categories** (unticked ones are left alone), and
+  **Group screenshots into month subfolders** (`Screenshots\yyyy-MM`, month taken
+  from the filename's date, falling back to the file's date). Re-**Scan** to apply.
+
+**2. Consolidate Folders** *(folder cleanup — opt-in)*
+- Off by default: tick **Include folders in the scan**, then **Scan Folders**.
+- Finds *obviously redundant* folders that share a theme — e.g. `Assorted Pictures`
+  + `More Random Pics` + `Pictures` → **Pictures**, or `Assorted Documents` + `word
+  docs` → **Documents** — and lists each source folder with its **file count** and
+  the **target** it would merge into.
+- A **Merge?** checkbox per row lets you approve each consolidation individually —
+  **nothing merges automatically**.
+- **Consolidate Checked** moves the files (de-duping names, never overwriting) and
+  removes each source folder once it's emptied.
+- **Never touches** system/app folders: hidden/system folders, anything starting
+  with `.`, `__` (e.g. `__MACOSX`) or `$`, known names like `config` / `node_modules`
+  / `Program Files`, the organizer's own category folders, and **any folder
+  containing an executable** (`.exe`, `.dll`, …).
+
+**3. Clean Names** *(filename cleanup)*
+- **Scan Names** proposes tidier names, shown **Old Name → New Name** side by side.
+- Fixes: `New folder`, ALL CAPS, double spaces, underscores-as-spaces, leading
+  `Copy of`, trailing `- Copy` / `(1) (2)` copy markers, and long random number
+  runs — all rendered in **Title Case**. **File extensions are left untouched.**
+- A **Rename?** checkbox per row; **Rename Checked** applies only the ticked ones
+  (after a confirm). Renames go into the **same undo log**, so **Undo Last Run**
+  reverses them.
 
 The window uses a dark theme with sensible padding and the Segoe UI font — not a
 1998 gray dialog.
@@ -232,15 +258,18 @@ and the scheduled task at once.
 
 ## How undo works
 
-Each run writes a JSON log like
-`organize_2026-06-07_09-00-00.json` containing the exact
-`from → to` path of every move. `Undo-LastOrganize.ps1`:
+Every operation — organizing, **folder consolidation**, and **renaming** — writes
+the same kind of JSON log (`organize_2026-06-07_09-00-00.json`) recording the exact
+`from → to` path of each change. Because a rename and a folder merge are just file
+moves under the hood, one undo mechanism reverses all three. **Undo Last Run** (in
+the GUI) and `Undo-LastOrganize.ps1`:
 
-1. Picks the newest log (or one you pass with `-LogFile`).
-2. Shows you what it will restore and prompts (use `-Force` to skip).
-3. Moves each file back **only if** the original spot is free — it never
-   overwrites. Anything it can't safely restore is reported and skipped.
-4. Renames the log to `*.undone.json` so it won't be picked up again.
+1. Pick the newest log (or one you pass with `-LogFile`).
+2. Show what they'll restore and prompt (use `-Force` to skip).
+3. Move each file back **only if** the original spot is free — never overwriting.
+   Anything that can't be safely restored is reported and skipped. (Consolidated
+   source folders are recreated automatically as their files return.)
+4. Rename the log to `*.undone.json` so it won't be picked up again.
 
 To undo a *specific* earlier run:
 
